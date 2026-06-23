@@ -1,41 +1,31 @@
 # terraform-tls-ephemeral-migrator
 
-Example Terraform module demonstrating full removal of TLS private keys from state using ephemeral resources. Secrets are never written to state for new deployments. Existing users can perform a one-time migration step to preserve their secret value while removing it from state.
+Example Terraform module demonstrating full removal of TLS private keys from state using ephemeral resources. Secrets are never written to Terraform state.
 
 ## Usage
 
-### New Deployments
+```hcl
+module "example" {
+  source  = "..."
+  version = "~> 2.0"
+}
+```
 
-No extra configuration needed — secrets are ephemeral and never written to state.
+To rotate the ephemeral secret, increment `secret_version`:
 
 ```hcl
 module "example" {
   source  = "..."
-  version = "~> 1.2"
+  version = "~> 2.0"
+
+  secret_version = 2
 }
 ```
-
-### Existing Deployments (one-time migration)
-
-Extract your current private key from state, pass it as `tls_private_key_data` on the first apply after upgrading. After a successful apply, remove the variable.
-
-```hcl
-module "example" {
-  source  = "..."
-  version = "~> 1.2"
-
-  # One-time migration only — remove after successful apply
-  # tls_private_key_data = var.tls_private_key_data
-}
-```
-
-See [docs/skills/tf-ephemeral-upgrade-terraform-tls-ephemeral-migrator.md](docs/skills/tf-ephemeral-upgrade-terraform-tls-ephemeral-migrator.md) for the complete step-by-step upgrade procedure.
 
 ## Variables
 
 | Name | Type | Default | Description |
 |------|------|---------|-------------|
-| `tls_private_key_data` | `string` (ephemeral, sensitive) | `null` | Legacy private key PEM. Pass only on the first apply when migrating existing deployments. Leave null for new deployments. |
 | `secret_version` | `number` | `1` | Increment to trigger a re-write of the write-only Vault secret. |
 
 ## Resources
@@ -47,7 +37,8 @@ See [docs/skills/tf-ephemeral-upgrade-terraform-tls-ephemeral-migrator.md](docs/
 
 ## Upgrading
 
-- [docs/skills/tf-ephemeral-upgrade-terraform-tls-ephemeral-migrator.md](docs/skills/tf-ephemeral-upgrade-terraform-tls-ephemeral-migrator.md) — Step-by-step upgrade assistant for existing deployments
+Users on v1.x upgrading directly to v2.0 must first upgrade to v1.2 and complete the one-time migration step.
+See [docs/UPGRADE-GUIDE-v2.0.0.md](docs/UPGRADE-GUIDE-v2.0.0.md) for full instructions.
 
 ## References
 
