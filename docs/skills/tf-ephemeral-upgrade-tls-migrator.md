@@ -428,5 +428,5 @@ terraform state push state.backup
 
 ## Related Documentation
 
-- [UPGRADE-GUIDE-2.0.md](../../UPGRADE-GUIDE-2.0.md) - Full upgrade guide
-- [MIGRATION-SUMMARY.md](../../MIGRATION-SUMMARY.md) - Technical migration details
+- [UPGRADE-GUIDE-2.0.md](../UPGRADE-GUIDE-2.0.md) - Full upgrade guide
+- [UPGRADE-GUIDE-v1.0.0.md](../UPGRADE-GUIDE-v1.0.0.md) - Technical migration details
