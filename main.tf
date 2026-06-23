@@ -8,3 +8,12 @@ resource "vault_kv_secret_v2" "legacy" {
   name      = "mytls"
   data_json = jsonencode({ private_key = tls_private_key.legacy.private_key_pem })
 }
+
+terraform {
+  required_providers {
+    vault = {
+      source  = "hashicorp/vault"
+      version = "5.9.0"
+    }
+  }
+}
