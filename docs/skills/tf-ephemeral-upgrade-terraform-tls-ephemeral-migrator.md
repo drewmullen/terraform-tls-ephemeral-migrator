@@ -1,302 +1,211 @@
 ---
 name: tf-ephemeral-upgrade-terraform-tls-ephemeral-migrator
 description: >
-  Assist with upgrading terraform-tls-ephemeral-migrator from v1.x to v2.0 (ephemeral defaults).
-  Handles secret extraction from state, writing secrets as workspace variables via API,
-  version pinning, and validation. Prefers v2.0 ephemeral mode and preserves secret values.
-  Use when upgrading this module to remove secrets from state.
+  Assist with upgrading terraform-tls-ephemeral-migrator from v1.x to v1.2.
+  Extracts legacy TLS private key from state into an env var, writes it as a sensitive
+  HCP Terraform workspace variable, upgrades module version, and validates.
+  After apply, removes the temporary workspace variable.
+  Use when upgrading existing deployments to remove the TLS private key from state.
 ---
 
-# terraform-tls-ephemeral-migrator Ephemeral Upgrade Assistant
+# terraform-tls-ephemeral-migrator Upgrade Assistant
 
-Upgrade terraform-tls-ephemeral-migrator from v1.x → v2.0. Secrets preserved by extracting from
-state and writing to HCP Terraform workspace variables via API before switching to ephemeral mode.
+Upgrade terraform-tls-ephemeral-migrator from v1.x → v1.2. The TLS private key is fully
+removed from state for all deployments. Existing users must perform a one-time step to
+preserve their current key value.
 
 ## Workflow
 
-1. Detect module usage in workspace
-2. Extract current secret values from state
-3. Write secret values to HCP Terraform workspace variables via API
-4. Upgrade module version to v2.0
-5. Validate upgrade
+1. Detect module usage
+2. Backup state
+3. Extract TLS private key from state into an env var
+4. Write key as a sensitive HCP Terraform workspace variable
+5. Upgrade module version and apply
+6. Delete the temporary workspace variable
 
 ## Prerequisites
 
-- Terraform v1.11+ (ephemeral support)
-- HCP Terraform workspace with API access
-- `curl` and `jq` installed
+- Terraform v1.11+
+- `curl` and `jq`
 - HCP Terraform API token
+- Workspace ID
 
 ## Step 1: Detect Module Usage
 
-Scan workspace for module calls:
-
 ```bash
 grep -rn 'module "terraform-tls-ephemeral-migrator"' . --include="*.tf"
-```
-
-Or use Terraform CLI:
-
-```bash
 terraform state list | grep 'module\.terraform-tls-ephemeral-migrator'
 ```
 
-Record:
-- Module call name
-- Module source
-- Current version (if pinned)
-- Workspace ID (from HCP Terraform UI or `terraform workspace show`)
-
-## Step 2: Extract Secret Values from State
-
-Extract the TLS private key before migration to preserve it.
-
-### tls_private_key.legacy → tls_private_key.legacy[0]
+Record workspace ID from HCP Terraform UI (Settings → General) or:
 
 ```bash
-terraform state pull | jq -r '
-  .resources[]
-  | select(.type == "tls_private_key" and .name == "legacy")
-  | .instances[0].attributes.private_key_pem
-'
+curl -s \
+  --header "Authorization: Bearer $TFC_TOKEN" \
+  "https://app.terraform.io/api/v2/organizations/<org>/workspaces/<workspace-name>" \
+  | jq -r '.data.id'
 ```
 
-**Security:** Keep extracted values in memory or a secure secrets manager. Do not write to disk unencrypted.
+## Step 2: Backup State
 
-## Step 3: Write Secrets to Workspace Variables via API
+```bash
+terraform state pull > tfstate-before-upgrade-$(date +%Y%m%d-%H%M%S).backup
+```
 
-Write extracted secret values as sensitive workspace variables in HCP Terraform.
+## Step 3: Extract TLS Private Key into Env Var
 
-**Set your workspace details:**
+The private key is stored under `tls_private_key.legacy` (v1.0.x) or `tls_private_key.legacy[0]` (v1.1.x).
+
+```bash
+SECRET_TLS_PRIVATE_KEY=$(terraform state pull | jq -r '
+  .resources[]
+  | select(.module == "module.terraform-tls-ephemeral-migrator" and .type == "tls_private_key")
+  | .instances[0].attributes.private_key_pem
+')
+```
+
+Verify the variable is populated (do not print value to stdout):
+
+```bash
+[ -n "$SECRET_TLS_PRIVATE_KEY" ] && echo "Key extracted successfully" || echo "ERROR: key not found in state"
+```
+
+If empty, the module may already be in ephemeral mode (`use_ephemeral_key = true`). In that case no
+extraction is needed — skip to Step 5 and omit `tls_private_key_data`.
+
+## Step 4: Write TLS Key to HCP Terraform Workspace
+
 ```bash
 TFC_TOKEN="<your-api-token>"
-WORKSPACE_ID="<your-workspace-id>"   # e.g. ws-abc123
+WORKSPACE_ID="<your-workspace-id>"
 TFC_API="https://app.terraform.io/api/v2"
 ```
-
-**Write the private key as a workspace variable:**
 
 ```bash
 curl -s \
   --request POST \
   --header "Authorization: Bearer $TFC_TOKEN" \
   --header "Content-Type: application/vnd.api+json" \
-  --data '{
-    "data": {
-      "type": "vars",
-      "attributes": {
-        "key": "tls_private_key_pem",
-        "value": "<extracted_private_key_pem>",
-        "category": "terraform",
-        "sensitive": true,
-        "description": "Preserved TLS private key migrated from state"
+  --data "{
+    \"data\": {
+      \"type\": \"vars\",
+      \"attributes\": {
+        \"key\": \"tls_private_key_data\",
+        \"value\": $(echo "$SECRET_TLS_PRIVATE_KEY" | jq -Rs .),
+        \"category\": \"terraform\",
+        \"sensitive\": true,
+        \"description\": \"One-time migration: legacy TLS private key from state\"
       }
     }
-  }' \
+  }" \
   "$TFC_API/workspaces/$WORKSPACE_ID/vars"
 ```
 
-**Verify variable was created:**
+Verify (sensitive value not shown):
+
 ```bash
 curl -s \
   --header "Authorization: Bearer $TFC_TOKEN" \
-  "$TFC_API/workspaces/$WORKSPACE_ID/vars" | jq '.data[] | {name: .attributes.key, sensitive: .attributes.sensitive}'
+  "$TFC_API/workspaces/$WORKSPACE_ID/vars" | \
+  jq '.data[] | {name: .attributes.key, sensitive: .attributes.sensitive}'
 ```
 
-The variable should appear with `"sensitive": true`. Value will not be shown.
+## Step 5: Upgrade Module and Apply
 
-## Step 4: Upgrade Module Version
-
-### Backup State First
-
-```bash
-terraform state pull > tfstate-before-upgrade-$(date +%Y%m%d-%H%M%S).backup
-```
-
-### Update Module Version
-
-Locate module block:
+Update module version:
 
 ```hcl
 module "terraform-tls-ephemeral-migrator" {
   source  = "..."
-  version = "~> 1.1"  # old version
+  version = "~> 1.2"
+
+  # All other config unchanged — do NOT set tls_private_key_data here,
+  # it is read from the workspace variable automatically
 }
 ```
-
-Update to v2.0:
-
-```hcl
-module "terraform-tls-ephemeral-migrator" {
-  source  = "..."
-  version = "~> 2.0"  # upgraded
-}
-```
-
-### Initialize Upgrade
 
 ```bash
 terraform init -upgrade
-```
-
-Expected output:
-```
-Upgrading modules...
-- terraform-tls-ephemeral-migrator in ...
-  Downloading <source> 2.0.0 for terraform-tls-ephemeral-migrator...
-```
-
-## Step 5: Validate Upgrade
-
-### Plan Upgrade
-
-```bash
 terraform plan -out=upgrade.tfplan
 ```
 
-### Expected Output
+Expected plan output:
 
 ```
-# module.terraform-tls-ephemeral-migrator.tls_private_key.legacy has moved to
-# module.terraform-tls-ephemeral-migrator.tls_private_key.legacy[0]
-  resource "tls_private_key" "legacy" {
-      # (no changes)
-  }
+# module.terraform-tls-ephemeral-migrator.tls_private_key.legacy[0] has been removed
+  (lifecycle.destroy = false — no infrastructure destroyed)
 
 # module.terraform-tls-ephemeral-migrator.vault_kv_secret_v2.legacy will be updated in-place
 ~ resource "vault_kv_secret_v2" "legacy" {
     ~ data_json    = (sensitive value) -> null
     + data_json_wo = (known after apply)
   }
-
-Plan: 0 to add, 1 to change, 0 to destroy.
 ```
 
 **Validation:**
-- ✅ Only `moved` operations and write-only attribute updates
+- ✅ `removed` block — resource leaves state, nothing destroyed
+- ✅ Consumer updated to write-only attribute
 - ✅ No resource creates or destroys
-- ✅ No infrastructure changes
-
-### Review Plan Carefully
-
-If the plan shows unexpected resource creates or destroys → **Do NOT apply**. Review troubleshooting section below.
-
-### Apply Upgrade
 
 ```bash
 terraform apply upgrade.tfplan
 ```
 
-## Rollback Procedure
+## Step 6: Delete Temporary Workspace Variable
 
-If issues arise:
+After a successful apply, the migration variable is no longer needed:
 
 ```bash
-# Restore state
-terraform state push tfstate-before-upgrade-<timestamp>.backup
+VAR_ID=$(curl -s \
+  --header "Authorization: Bearer $TFC_TOKEN" \
+  "$TFC_API/workspaces/$WORKSPACE_ID/vars" | \
+  jq -r '.data[] | select(.attributes.key == "tls_private_key_data") | .id')
 
-# Revert module version in config
-# version = "~> 1.1"
+curl -s \
+  --request DELETE \
+  --header "Authorization: Bearer $TFC_TOKEN" \
+  "$TFC_API/workspaces/$WORKSPACE_ID/vars/$VAR_ID"
 
-# Re-initialize
-terraform init -upgrade
-
-# Verify rollback
-terraform plan  # Should show no changes
+echo "Migration variable deleted"
 ```
+
+## Rollback
+
+Before apply:
+
+```bash
+terraform state push tfstate-before-upgrade-<timestamp>.backup
+```
+
+After apply, rollback requires re-importing the removed resource — contact the module maintainer.
 
 ## Troubleshooting
 
-### "Ephemeral values not valid for attribute"
+### "Variable is not ephemeral"
 
 **Error:**
 ```
 Error: Invalid use of ephemeral value
-  Ephemeral values are not valid for "data_json"
 ```
 
-**Fix:**
-- Verify module version is v2.0+
-- Check module uses `data_json_wo` for ephemeral path
+**Fix:** Verify module version is v1.2+. The `tls_private_key_data` variable must have `ephemeral = true`.
 
-### "Invalid index" on resource[0]
+### Plan shows unexpected destroys
 
-**Error:**
-```
-Error: Invalid index
-  The given key does not identify an element
-```
+**Fix:** Do NOT apply. Verify the workspace variable was created successfully (Step 4). Verify the module version is correct.
 
-**Fix:** Module uses `one(resource[*].attr)` pattern. If this error appears, report bug to module maintainer.
+### Key not found in state (Step 3)
 
-### Unexpected resource creates or destroys
+If the key extraction returns empty, the module was already running in ephemeral mode (`use_ephemeral_key = true`). The key was already being generated ephemerally and is not in state. Skip Step 4 and proceed directly to Step 5 without setting `tls_private_key_data`. A new ephemeral key will be generated on the next apply.
 
-**Issue:** Plan shows infrastructure additions or deletions.
-
-**Fix:**
-1. Do NOT apply
-2. Review [UPGRADE-GUIDE-v2.0.0.md](../UPGRADE-GUIDE-v2.0.0.md) for known issues
-3. Verify module version is correct
-4. Report issue if persists
-
-## Commands Reference
+### Workspace variable not found in Step 6
 
 ```bash
-# Backup state
-terraform state pull > state.backup
-
-# Detect module usage
-terraform state list | grep 'module\.terraform-tls-ephemeral-migrator'
-
-# Extract TLS private key
-terraform state pull | jq -r '.resources[] | select(.type == "tls_private_key" and .name == "legacy") | .instances[0].attributes.private_key_pem'
-
-# Write workspace variable
-curl -s --request POST \
-  --header "Authorization: Bearer $TFC_TOKEN" \
-  --header "Content-Type: application/vnd.api+json" \
-  --data '{"data":{"type":"vars","attributes":{"key":"tls_private_key_pem","value":"<value>","category":"terraform","sensitive":true}}}' \
-  "$TFC_API/workspaces/$WORKSPACE_ID/vars"
-
-# List workspace variables
 curl -s --header "Authorization: Bearer $TFC_TOKEN" \
-  "$TFC_API/workspaces/$WORKSPACE_ID/vars" | jq '.data[] | {name: .attributes.key, sensitive: .attributes.sensitive}'
-
-# Upgrade module
-terraform init -upgrade
-
-# Plan upgrade
-terraform plan -out=upgrade.tfplan
-
-# Apply upgrade
-terraform apply upgrade.tfplan
-
-# Rollback
-terraform state push state.backup
+  "$TFC_API/workspaces/$WORKSPACE_ID/vars" | jq '.data[].attributes.key'
 ```
-
-## FAQ
-
-**Q: Why write secrets as workspace variables?**
-- Secrets preserved from current state without exposure to disk
-- Sensitive variables never shown in HCP Terraform UI or logs
-- Module can reference via `var.<name>` input
-
-**Q: What if I don't have the workspace ID?**
-- HCP Terraform UI: Settings → General → ID field
-- Or: `curl -H "Authorization: Bearer $TFC_TOKEN" "https://app.terraform.io/api/v2/organizations/<org>/workspaces/<name>" | jq '.data.id'`
-
-**Q: What if I need to rollback?**
-- Restore state backup, revert version, reinitialize
-
-**Q: Can I upgrade without downtime?**
-- Yes — `moved` blocks ensure no resource destroy/create
-
-**Q: What if I don't use HCP Terraform?**
-- Extract the private key value from state and store it in your preferred secrets manager
-- Pass the value as a module input variable instead of using workspace variables
 
 ## Related Documentation
 
-- [UPGRADE-GUIDE-v2.0.0.md](../UPGRADE-GUIDE-v2.0.0.md) - Full upgrade guide
-- [examples/](../../examples/) - Reference implementations
+- [UPGRADE-GUIDE-v2.0.0.md](../UPGRADE-GUIDE-v2.0.0.md) - Full upgrade guide for v1.x → v2.0
+- [README.md](../../README.md)
