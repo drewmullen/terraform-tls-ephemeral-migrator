@@ -1,7 +1,7 @@
 variable "use_ephemeral_key" {
   description = "Use ephemeral key (not stored in state)"
   type        = bool
-  default     = false
+  default     = true
 }
 
 variable "secret_version" {
